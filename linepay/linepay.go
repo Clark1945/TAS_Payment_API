@@ -2,7 +2,9 @@ package linepay
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -11,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -21,14 +24,22 @@ import (
 // 商店ID:test_202503193091
 // 統編:24941093
 const (
-	domain          string = "https://sandbox-api-pay.line.me"
-	authPath        string = "/v3/payments/request"
-	callbackPath    string = "/v3/payments/%s/confirm"
-	queryPath       string = "/v3/payments?transactionId=%s&orderId=%s"
-	refundPath      string = "/v3/payments/%s/refund"
-	merId                  = "test_202503193091"
-	callbackUrl     string = "http://localhost:8080/callback"
-	failCallbackUrl string = "http://localhost:8080/failCallback"
+	domain             string = "https://sandbox-api-pay.line.me"
+	authPath           string = "/v3/payments/request"
+	callbackPath       string = "/v3/payments/%s/confirm"
+	queryPath          string = "/v3/payments?transactionId=%s&orderId=%s"
+	refundPath         string = "/v3/payments/%s/refund"
+	merId                     = "test_202503193091"
+	callbackUrl        string = "http://localhost:8080/callback"
+	failCallbackUrl    string = "http://localhost:8080/failCallback"
+	StatusSuccess             = "0000"
+	StatusAuth                = "AUTH"
+	StatusAuthFail            = "AUTH_FAIL"
+	StatusPaidSuccess         = "PAID_SUCCESS"
+	ContentTypeJSON           = "application/json"
+	ErrOnlyPostAllowed        = "Only POST allowed"
+	ErrRequestBody            = "Request Body Error"
+	ErrResponse               = "Response Error"
 )
 
 var tempMap = make(map[string]map[string]string)
@@ -36,45 +47,49 @@ var tempMap = make(map[string]map[string]string)
 // API Handler: 對外提供 `/auth` 端點
 func AuthHandler(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodPost {
-		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
+		respondWithError(w, ErrOnlyPostAllowed, http.StatusMethodNotAllowed)
 		return
 	}
+	fmt.Println("auth started")
 
-	reqByte, err := io.ReadAll(req.Body)
-	if err != nil {
-		log.Println(err)
-		http.Error(w, "Request Body Error", http.StatusBadRequest)
-		return
-	}
+	// 原先做法 io.Reader轉成Byte，再由Byte轉換成物件
+	// 更好做法 使用json.NewDecoder讀取reqBody並直接轉換成物件
 	var merchantReq MerchantAuthReq
-	err = json.Unmarshal(reqByte, &merchantReq)
-	if err != nil {
-		log.Println(err)
-		http.Error(w, "Request Body Error", http.StatusBadRequest)
+	if err := json.NewDecoder(req.Body).Decode(&merchantReq); err != nil {
+		respondWithError(w, ErrRequestBody, http.StatusBadRequest)
 		return
 	}
 
 	chanId := merchantReq.PaymentConfig["channelId"]
 	chanSec := merchantReq.PaymentConfig["channelSec"]
-	linePayReq := newAuthReq(&merchantReq.TransactionId, &merchantReq.TotalPrice, &merchantReq.Currency)
+	linePayReq := newAuthReq(
+		&merchantReq.TransactionId,
+		&merchantReq.TotalPrice,
+		&merchantReq.Currency,
+	)
 
 	linePayResp, err := auth(&linePayReq, &chanId, &chanSec)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Auth failed: %v", err), http.StatusInternalServerError)
+		respondWithError(w, fmt.Sprintf("Auth failed: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	var merResp MerchantAuthResp
-	merResp.Correlationid = merchantReq.Correlationid
-	merResp.TransactionId = merchantReq.TransactionId
-	merResp.CallTime = time.Now().Format("2006-01-02 15:04:05")
-	merResp.RespCode = linePayResp.ReturnCode
-	merResp.RespMsg = linePayResp.ReturnMessage
-	if linePayResp.ReturnCode == "0000" { // 交易成功
+	logWithResponse(linePayResp)
+
+	merResp := MerchantAuthResp{
+		Correlationid: merchantReq.Correlationid,
+		TransactionId: merchantReq.TransactionId,
+		CallTime:      time.Now().Format("2006-01-02 15:04:05"),
+		RespCode:      linePayResp.ReturnCode,
+		RespMsg:       linePayResp.ReturnMessage,
+		Currency:      merchantReq.Currency,
+	}
+
+	if linePayResp.ReturnCode == StatusSuccess { // Payment Success
 		merResp.LegacyId = strconv.Itoa(linePayResp.Info.TxId)
 		merResp.PaymentUrl = linePayResp.Info.PaymentUrl.Web
 		merResp.Currency = merchantReq.Currency
-		merResp.Status = "AUTH"
+		merResp.Status = StatusAuth
 
 		// 暫代緩存
 		tempMap[merResp.LegacyId] = map[string]string{
@@ -87,23 +102,93 @@ func AuthHandler(w http.ResponseWriter, req *http.Request) {
 		merResp.Status = "AUTH_FAIL"
 	}
 
-	respByte, err := json.Marshal(merResp)
+	// 原先做法，將struct轉成byte，再從byte轉成map回傳
+	// 後續做法，直接回傳struct
+	if err := respondWithJSON(w, merResp); err != nil {
+		respondWithError(w, ErrResponse, http.StatusInternalServerError)
+	}
+	fmt.Println("auth ended")
+}
+
+func CallbackHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("Starting LINE Pay callback")
+	legacyId := r.URL.Query().Get("transactionId")
+	chanId := tempMap[legacyId]["channelId"]
+	chanSec := tempMap[legacyId]["channelSec"]
+	transactionId := tempMap[legacyId]["transactionId"]
+
+	totalFee, err := strconv.Atoi(tempMap[legacyId]["totalPrice"])
 	if err != nil {
-		http.Error(w, "Response Error", 500)
+		log.Println(err)
 		return
 	}
-	var respMap map[string]interface{}
-	err = json.Unmarshal(respByte, &respMap)
+	reqMap := map[string]interface{}{
+		"amount":   totalFee,
+		"currency": tempMap[legacyId]["currency"],
+	}
+
+	// 處理規格
+	reqBodyByte, err := json.Marshal(reqMap)
 	if err != nil {
-		http.Error(w, "Response Error", 500)
+		return
+	}
+	req, err := http.NewRequest(http.MethodPost, domain+fmt.Sprintf(callbackPath, legacyId), bytes.NewReader(reqBodyByte))
+	if err != nil { // reqBody Error!
+		log.Println(err)
+		return
+	}
+	reqBodyStr := string(reqBodyByte)
+	appendHeader(req, &reqBodyStr, fmt.Sprintf(callbackPath, legacyId), chanId, chanSec)
+
+	// 發送請求
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		respondWithError(w, "Error while sending callback", http.StatusServiceUnavailable)
+		return
+	}
+	defer resp.Body.Close() // Delay disconnect the connection.
+
+	var callbackResp CallbackResp
+	if err = json.NewDecoder(resp.Body).Decode(&callbackResp); err != nil {
+		respondWithError(w, "Error while parsing callback", http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(respMap)
+	logWithResponse(callbackResp)
+
+	respMap := map[string]interface{}{
+		"transactionId": transactionId,
+		"legacyId":      legacyId,
+		"respCode":      callbackResp.ReturnCode,
+		"respMsg":       callbackResp.ReturnMessage,
+	}
+	if callbackResp.ReturnCode == StatusSuccess {
+		respMap["totalFee"] = totalFee
+		respMap["paidTime"] = time.Now().Format("2006-01-02 15:04:05")
+		respMap["status"] = StatusPaidSuccess
+	} else {
+		respMap["status"] = "FAIL"
+	}
+
+	respondWithJSON(w, respMap)
 }
 
 // TODO 檢查 請求
+
+// // 將交易資訊存入資料庫/緩存的函數
+// func storeTransactionData(legacyID string, req MerchantAuthReq, chanID, chanSec string) {
+// 	// 使用互斥鎖保護 tempMap 操作，或更好的方式是使用資料庫/Redis等
+// 	tempMapMutex.Lock()
+// 	defer tempMapMutex.Unlock()
+
+// 	tempMap[legacyID] = map[string]string{
+// 		"transactionId": req.TransactionId,
+// 		"channelId":     chanID,
+// 		"channelSec":    chanSec,
+// 		"totalPrice":    strconv.Itoa(req.TotalPrice),
+// 		"currency":      req.Currency,
+// 	}
+// }
 
 func newAuthReq(orderId *string, amount *int, currency *string) LinePayAuthRequest {
 	// LinePay 付款結構，忽略商品結構
@@ -132,264 +217,238 @@ func newAuthReq(orderId *string, amount *int, currency *string) LinePayAuthReque
 	}
 }
 
-func auth(request *LinePayAuthRequest, chanId *string, chanSec *string) (*LinePayResp, error) {
-	// auth API == Payment
-	fmt.Println("auth started")
+// AuthService 定義了授權相關功能的接口
+type AuthService interface {
+	Authorize(request *LinePayAuthRequest, channelID, channelSecret string) (*LinePayAuthResponse, error)
+}
 
-	// 處理規格 我覺得有點多此一舉
+// DefaultAuthService 是 AuthService 的默認實現
+type DefaultAuthService struct {
+	client  *http.Client
+	baseURL string
+}
+
+// NewAuthService 創建新的授權服務
+func NewAuthService(baseURL string) AuthService {
+	return &DefaultAuthService{
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+		},
+		baseURL: baseURL,
+	}
+}
+
+// Authorize 處理 LINE Pay 授權請求
+func (s *DefaultAuthService) Authorize(request *LinePayAuthRequest, channelID, channelSecret string) (*LinePayAuthResponse, error) {
+	ctx := context.Background()
+	return s.AuthorizeWithContext(ctx, request, channelID, channelSecret)
+}
+
+// AuthorizeWithContext 帶有上下文的授權請求處理
+func (s *DefaultAuthService) AuthorizeWithContext(ctx context.Context, request *LinePayAuthRequest, channelID, channelSecret string) (*LinePayAuthResponse, error) {
+	log.Println("Starting LINE Pay authorization")
+
+	// 1. 序列化請求體
 	reqBody, err := json.Marshal(request)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", domain+authPath, bytes.NewReader(reqBody))
-	if err != nil { // reqBody Error!
-		log.Println(err)
-		return nil, err
+	// 2. 創建 HTTP 請求
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+authPath, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
+	// 3. 添加請求頭
 	reqStr := string(reqBody)
-	err = appendHeader(req, &reqStr, authPath, chanId, chanSec)
-	if err != nil {
-		log.Println(err)
-		return nil, err
+	if err := appendHeader(req, &reqStr, authPath, channelID, channelSecret); err != nil {
+		return nil, fmt.Errorf("failed to append headers: %w", err)
 	}
 
-	// 發送請求
-	resp, err := http.DefaultClient.Do(req)
+	// 4. 發送請求
+	resp, err := s.client.Do(req)
 	if err != nil {
-		log.Println(err)
-		return nil, err
+		return nil, fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close() // Delay disconnect the connection.
+	defer resp.Body.Close()
 
-	// 解析Response
-	respByte, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Println(err)
-		return nil, err
+	// 5. 檢查 HTTP 狀態碼
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(body))
 	}
-	var linePayResp LinePayResp
-	err = json.Unmarshal(respByte, &linePayResp)
-	if err != nil {
-		log.Println("解析失敗:", err)
-	}
-	prettyPrint, err := json.MarshalIndent(linePayResp, "", "  ")
-	if err != nil {
-		log.Println(err)
-		return nil, err
-	}
-	fmt.Println(string(prettyPrint))
 
-	fmt.Println("auth end")
+	// 6. 解析回應
+	var linePayResp LinePayAuthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&linePayResp); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
 	return &linePayResp, nil
 }
 
-func appendHeader(req *http.Request, reqStr *string, path string, chanId *string, chanSec *string) error {
-	nonce := fmt.Sprint(time.Now().UnixMilli())
-	signature, err := signKey(*chanSec, fmt.Sprintf("%s%s%s%s", *chanSec, path, *reqStr, nonce))
-	if err != nil {
-		return err
-	}
-	req.Header.Add("X-LINE-ChannelId", *chanId)
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("X-LINE-Authorization", signature)
-	req.Header.Add("X-LINE-Authorization-Nonce", nonce)
+func auth(request *LinePayAuthRequest, chanId *string, chanSec *string) (*LinePayAuthResponse, error) {
+	service := NewAuthService(domain)
+	return service.Authorize(request, *chanId, *chanSec)
+}
+
+// appendHeader 添加 LINE Pay 需要的認證頭
+func appendHeader(req *http.Request, body *string, path, channelID, channelSecret string) error {
+	nonce := generateNonce()
+	timestamp := fmt.Sprintf("%d", time.Now().Unix())
+
+	// 組合簽名字符串
+	signatureBase := fmt.Sprintf("%s%s%s%s", channelSecret, path, *body, nonce)
+
+	// 計算 HMAC-SHA256
+	mac := hmac.New(sha256.New, []byte(channelSecret))
+	mac.Write([]byte(signatureBase))
+	signature := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+
+	// 設置請求頭
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-LINE-ChannelId", channelID)
+	req.Header.Set("X-LINE-Authorization-Nonce", nonce)
+	req.Header.Set("X-LINE-Authorization", signature)
+	req.Header.Set("X-LINE-Authorization-Timestamp", timestamp)
+
 	return nil
 }
 
-func signKey(clientKey, msg string) (string, error) {
-	// Create an HMAC hasher using SHA-256 and the client key
-	h := hmac.New(sha256.New, []byte(clientKey))
-
-	// Write the message to the hasher
-	_, err := h.Write([]byte(msg))
+// generateNonce 生成隨機字符串作為 nonce
+func generateNonce() string {
+	b := make([]byte, 16)
+	_, err := rand.Read(b)
 	if err != nil {
-		return "", err
+		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
-
-	// Compute the HMAC digest and encode it as base64
-	return base64.StdEncoding.EncodeToString(h.Sum(nil)), nil
+	return fmt.Sprintf("%x", b)
 }
 
-func CallbackHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("callback start")
-	legacyId := r.URL.Query().Get("transactionId")
-	chanId := tempMap[legacyId]["channelId"]
-	chanSec := tempMap[legacyId]["channelSec"]
-	transactionId := tempMap[legacyId]["transactionId"]
+// 統一的回應輔助函數
+func respondWithError(w http.ResponseWriter, message string, statusCode int) {
+	log.Printf("Error: %s", message)
+	http.Error(w, message, statusCode)
+}
 
-	totalFee, err := strconv.Atoi(tempMap[legacyId]["totalPrice"])
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	reqMap := map[string]interface{}{
-		"amount":   totalFee,
-		"currency": tempMap[legacyId]["currency"],
-	}
+func respondWithJSON(w http.ResponseWriter, data interface{}) error {
+	w.Header().Set("Content-Type", ContentTypeJSON)
+	return json.NewEncoder(w).Encode(data)
+}
 
-	// 處理規格
-	reqBody, err := json.Marshal(reqMap)
-	if err != nil {
+func QueryHandler(w http.ResponseWriter, req *http.Request) {
+	fmt.Println("Query started")
+
+	var merchantQueryReq MerchantQueryReq
+	if err := json.NewDecoder(req.Body).Decode(&merchantQueryReq); err != nil {
+		respondWithError(w, ErrRequestBody, http.StatusBadRequest)
 		return
 	}
 
-	req, err := http.NewRequest("POST", domain+fmt.Sprintf(callbackPath, legacyId), bytes.NewReader(reqBody))
-	if err != nil { // reqBody Error!
-		log.Println(err)
+	fullQueryPath := fmt.Sprintf(domain+queryPath, merchantQueryReq.LegacyID, merchantQueryReq.TransactionID)
+	request, err := http.NewRequest("GET", fullQueryPath, nil)
+	if err != nil {
+		respondWithError(w, ErrRequestBody, http.StatusBadRequest)
 		return
 	}
 
-	reqDummp := string(reqBody)
-	appendHeader(req, &reqDummp, fmt.Sprintf(callbackPath, legacyId), &chanId, &chanSec)
+	slice := strings.Split(fmt.Sprintf(queryPath, merchantQueryReq.LegacyID, merchantQueryReq.TransactionID), "?")
+	appendHeader(request, &slice[1], slice[0], merchantQueryReq.PaymentConfig["channelId"], merchantQueryReq.PaymentConfig["channelSec"])
 
-	// 發送請求
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(request)
 	if err != nil {
-		log.Println(err)
+		log.Println("連線異常, ", err)
 		return
 	}
-	defer resp.Body.Close() // Delay disconnect the connection.
+	defer resp.Body.Close()
 
-	// 解析Response
-	respByte, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Println(err)
+	var queryResp QueryResponse
+	if err = json.NewDecoder(resp.Body).Decode(&queryResp); err != nil {
+		respondWithError(w, "Error while parsing response", http.StatusBadRequest)
+		return
 	}
-
-	var callbackResp CallbackResp
-	err = json.Unmarshal(respByte, &callbackResp)
-	if err != nil {
-		log.Println(err)
-	}
+	logWithResponse(queryResp)
 	respMap := map[string]interface{}{
-		"transactionId": transactionId,
-		"legacyId":      legacyId,
-		"respCode":      callbackResp.ReturnCode,
-		"respMsg":       callbackResp.ReturnMessage,
+		"transactionId": merchantQueryReq.TransactionID,
+		"legacyId":      merchantQueryReq.LegacyID,
+		"respCode":      queryResp.ReturnCode,
+		"respMsg":       queryResp.ReturnMessage,
 	}
-	if callbackResp.ReturnCode == "0000" {
-		respMap["totalFee"] = totalFee
-		respMap["paidTime"] = time.Now().Format("2006-01-02 15:04:05")
-		respMap["status"] = "PAID_SUCCESS"
+	if queryResp.ReturnCode == StatusSuccess {
+		respMap["status"] = "SUCCESS"
+		respMap["payStatus"] = queryResp.QueryInfo[0].PayStatus
+		respMap["transactionDate"] = queryResp.QueryInfo[0].TransactionDate
+	}
+	respondWithJSON(w, respMap)
+	fmt.Println("Query end")
+}
+
+func logWithResponse(input interface{}) {
+	respNewByte, err := json.MarshalIndent(input, "", " ")
+	if err != nil {
+		log.Println(err)
+	}
+	fmt.Println(string(respNewByte))
+}
+
+func RefundHandler(w http.ResponseWriter, req *http.Request) {
+	fmt.Println("Refund started")
+
+	var merchantRefundReq MerchantRefundReq
+	if err := json.NewDecoder(req.Body).Decode(&merchantRefundReq); err != nil {
+		respondWithError(w, ErrRequestBody, http.StatusBadRequest)
+		return
+	}
+
+	reqMap := map[string]int{
+		"refundAmount": merchantRefundReq.RefundPrice,
+	}
+	reqByte, err := json.Marshal(reqMap)
+	if err != nil {
+		respondWithError(w, ErrRequestBody, http.StatusBadRequest)
+	}
+
+	path := fmt.Sprintf(refundPath, merchantRefundReq.LegacyId)
+	request, err := http.NewRequest(http.MethodPost, domain+path, bytes.NewReader(reqByte))
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	reqBodyStr := string(reqByte)
+	chanId := merchantRefundReq.PaymentConfig["channelId"]
+	chanSec := merchantRefundReq.PaymentConfig["channelSec"]
+	appendHeader(request, &reqBodyStr, path, chanId, chanSec)
+
+	resp, err := http.DefaultClient.Do(request)
+	if err != nil {
+		log.Println("連線異常, ", err)
+		return
+	}
+
+	var refundRespInfo RefundRespInfo
+	if err = json.NewDecoder(resp.Body).Decode(&refundRespInfo); err != nil {
+		respondWithError(w, "Error with parsing response", http.StatusInternalServerError)
+	}
+	logWithResponse(refundRespInfo)
+
+	respMap := map[string]interface{}{
+		"transactionId": merchantRefundReq.TransctionId,
+		"legacyId":      merchantRefundReq.LegacyId,
+		"refundAmount":  merchantRefundReq.RefundPrice,
+		"refundNo":      merchantRefundReq.RefundNo,
+		"respCode":      refundRespInfo.ReturnCode,
+		"respMsg":       refundRespInfo.ReturnMsg,
+	}
+	if refundRespInfo.ReturnCode == StatusSuccess {
+		respMap["refundTransactionDate"] = refundRespInfo.Info.RefundTransactionDate
+		respMap["refundLegacyId"] = refundRespInfo.Info.RefundTransactionId
+		respMap["status"] = "REFUND"
 	} else {
 		respMap["status"] = "FAIL"
 	}
 
-	prettyPrint, err := json.MarshalIndent(callbackResp, "", "  ")
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	fmt.Println(string(prettyPrint))
+	fmt.Println("Refund end")
+	respondWithJSON(w, respMap)
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(respMap)
 }
-
-// func QueryHandler(w http.ResponseWriter, req *http.Request) {
-// 	fmt.Println("Query started")
-
-// 	reqByte, err := io.ReadAll(req.Body)
-// 	if err != nil {
-// 		log.Println(err)
-// 		return
-// 	}
-
-// 	var reqMap map[string]interface{}
-// 	err = json.Unmarshal(reqByte, &reqMap)
-// 	if err != nil {
-// 		log.Println(err)
-// 		return
-// 	}
-
-// 	fullQueryPath := fmt.Sprintf(domain+queryPath, reqMap["transactionId"], reqMap["orderId"])
-// 	request, err := http.NewRequest("GET", fullQueryPath, nil)
-// 	if err != nil {
-// 		log.Println(err)
-// 		return
-// 	}
-
-// 	slice := strings.Split(fmt.Sprintf(queryPath, reqMap["transactionId"], reqMap["orderId"]), "?")
-// 	appendHeader(request, &slice[1], slice[0])
-
-// 	resp, err := http.DefaultClient.Do(request)
-// 	if err != nil {
-// 		log.Println("連線異常, ", err)
-// 		return
-// 	}
-
-// 	respByte, err := io.ReadAll(resp.Body)
-// 	if err != nil {
-// 		log.Println(err)
-// 	}
-
-// 	var respMap map[string]interface{}
-// 	err = json.Unmarshal(respByte, &respMap)
-// 	if err != nil {
-// 		log.Println(err)
-// 	}
-
-// 	respNewByte, err := json.MarshalIndent(respMap, "", " ")
-// 	if err != nil {
-// 		log.Println(err)
-// 	}
-// 	fmt.Println(string(respNewByte))
-// 	w.Header().Set("Content-Type", "application/json")
-// 	json.NewEncoder(w).Encode(respMap)
-// 	fmt.Println("Query end")
-// }
-
-// func RefundHandler(w http.ResponseWriter, req *http.Request) {
-// 	fmt.Println("Refund started")
-
-// 	reqByte, err := io.ReadAll(req.Body)
-// 	if err != nil {
-// 		log.Println(err)
-// 		return
-// 	}
-
-// 	var reqMap map[string]interface{}
-// 	err = json.Unmarshal(reqByte, &reqMap)
-// 	if err != nil {
-// 		log.Println(err)
-// 		return
-// 	}
-
-// 	path := fmt.Sprintf(refundPath, "2025032102277666310")
-// 	request, err := http.NewRequest("POST", domain+path, bytes.NewReader(reqByte))
-// 	if err != nil {
-// 		log.Println(err)
-// 		return
-// 	}
-
-// 	reqDummp := string(reqByte)
-// 	appendHeader(request, &reqDummp, path)
-
-// 	resp, err := http.DefaultClient.Do(request)
-// 	if err != nil {
-// 		log.Println("連線異常, ", err)
-// 		return
-// 	}
-
-// 	respByte, err := io.ReadAll(resp.Body)
-// 	if err != nil {
-// 		log.Println(err)
-// 	}
-
-// 	var respMap map[string]interface{}
-// 	err = json.Unmarshal(respByte, &respMap)
-// 	if err != nil {
-// 		log.Println(err)
-// 	}
-
-// 	respNewByte, err := json.MarshalIndent(respMap, "", " ")
-// 	if err != nil {
-// 		log.Println(err)
-// 	}
-// 	fmt.Println(string(respNewByte))
-// 	w.Header().Set("Content-Type", "application/json")
-// 	json.NewEncoder(w).Encode(respMap)
-// 	fmt.Println("Refund end")
-// }

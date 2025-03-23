@@ -1,22 +1,7 @@
 package linepay
 
-type LinePayResp struct {
-	Info          LinepayRespInfo `json:"info"`
-	ReturnCode    string          `json:"returnCode"`
-	ReturnMessage string          `json:"returnMessage"`
-}
-type LinepayRespInfo struct {
-	Token      string     `json:"paymentAccessToken"`
-	PaymentUrl PaymentUrl `json:"paymentUrl"`
-	TxId       int        `json:"transactionId"`
-}
-type PaymentUrl struct {
-	App string `json:"app"`
-	Web string `json:"web"`
-}
-
 // LinePayRequest 代表發送至 Line Pay API 的請求
-type LinePayRequest struct {
+type LinePayAuthRequest struct {
 	Amount       int          `json:"amount"`
 	Currency     string       `json:"currency"`
 	OrderID      string       `json:"orderId"`
@@ -24,7 +9,6 @@ type LinePayRequest struct {
 	RedirectUrls RedirectUrls `json:"redirectUrls"`
 }
 
-// Package 代表訂單內的商品包
 type Package struct {
 	ID       string    `json:"id"`
 	Amount   int       `json:"amount"`
@@ -44,4 +28,58 @@ type Product struct {
 type RedirectUrls struct {
 	ConfirmUrl string `json:"confirmUrl"`
 	CancelUrl  string `json:"cancelUrl"`
+}
+
+type LinePayResp struct {
+	Info          LinepayRespInfo `json:"info"`
+	ReturnCode    string          `json:"returnCode"`
+	ReturnMessage string          `json:"returnMessage"`
+}
+
+type LinepayRespInfo struct {
+	Token      string     `json:"paymentAccessToken"`
+	PaymentUrl PaymentUrl `json:"paymentUrl"`
+	TxId       int        `json:"transactionId"`
+}
+type PaymentUrl struct {
+	App string `json:"app"`
+	Web string `json:"web"`
+}
+
+// 定義 Info 結構
+type Info struct {
+	OrderID       string `json:"orderId"`
+	TransactionID int64  `json:"transactionId"`
+}
+
+// 定義根結構
+type CallbackResp struct {
+	ReturnCode    string `json:"returnCode"`
+	ReturnMessage string `json:"returnMessage"`
+	Info          Info   `json:"info"`
+}
+
+type MerchantAuthReq struct {
+	TransactionId string            `json:"transactionId"`
+	Correlationid string            `json:"correlationid"`
+	TotalPrice    int               `json:"totalPrice"`
+	Currency      string            `json:"currency"`
+	PaymentConfig map[string]string `json:"paymentConfig"`
+	ReqTime       string            `json:"reqTime"`
+	CallbackUrl   string            `json:"callbackUrl"`
+	NotifyUrl     string            `json:"notifyUrl"`
+	// 加密簽章參數
+}
+
+type MerchantAuthResp struct {
+	TransactionId string `json:"transactionId"`
+	LegacyId      string `json:"legacyId"`
+	Correlationid string `json:"correlationid"`
+	PaymentUrl    string `json:"paymentUrl"`
+	Currency      string `json:"currency"`
+	CallTime      string `json:"callTime"`
+	Status        string `json:"status"`
+	RespCode      string `json:"respCode"`
+	RespMsg       string `json:"respMsg"`
+	// 加密簽章參數
 }

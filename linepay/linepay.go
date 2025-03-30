@@ -141,21 +141,21 @@ func CallbackHandler(w http.ResponseWriter, r *http.Request) {
 	// 發送請求
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		respondWithError(w, "Error while sending callback", http.StatusServiceUnavailable)
+		merchant.RespondWithError(w, "Error while sending callback", http.StatusServiceUnavailable)
 		return
 	}
 	defer resp.Body.Close() // Delay disconnect the connection.
 
 	var callbackResp CallbackResp
 	if err = json.NewDecoder(resp.Body).Decode(&callbackResp); err != nil {
-		respondWithError(w, "Error while parsing callback", http.StatusInternalServerError)
+		merchant.RespondWithError(w, "Error while parsing callback", http.StatusInternalServerError)
 		return
 	}
 
-	logWithResponse(callbackResp)
+	merchant.LogWithResponse(callbackResp)
 
 	merchantCallbackResp := NewMerchantCallbackResp(transactionId, legacyId, callbackResp.ReturnCode, callbackResp.ReturnMessage, totalFee)
-	respondWithJSON(w, merchantCallbackResp)
+	merchant.RespondWithJSON(w, merchantCallbackResp)
 }
 
 // TODO 檢查 請求
